@@ -140,6 +140,13 @@ def test_insert(valkey_db, mock_valkey_client):
     assert kwargs["mapping"]["user_id"] == "test_user"
     assert "created_at" in kwargs["mapping"]
     assert "embedding" in kwargs["mapping"]
+    # Check updated_at is set equal to created_at for ElastiCache compatibility
+    assert kwargs["mapping"]["updated_at"] == kwargs["mapping"]["created_at"]
+    # Check metadata excludes system keys
+    metadata = json.loads(kwargs["mapping"]["metadata"])
+    assert "user_id" not in metadata
+    assert "hash" not in metadata
+    assert "data" not in metadata
 
 
 def test_insert_handles_missing_created_at(valkey_db, mock_valkey_client):
@@ -156,6 +163,21 @@ def test_insert_handles_missing_created_at(valkey_db, mock_valkey_client):
     mock_valkey_client.hset.assert_called_once()
     args, kwargs = mock_valkey_client.hset.call_args
     assert "created_at" in kwargs["mapping"]  # Should be added automatically
+    assert "updated_at" in kwargs["mapping"]  # Should also be set
+
+
+def test_insert_handles_missing_data_and_hash_fields(valkey_db, mock_valkey_client):
+    """Test inserting vectors with missing data and hash fields uses default values."""
+    vectors = [np.random.rand(1536).tolist()]
+    payloads = [{}]  # No data or hash fields
+    ids = ["test_id"]
+
+    valkey_db.insert(vectors=vectors, payloads=payloads, ids=ids)
+
+    mock_valkey_client.hset.assert_called_once()
+    args, kwargs = mock_valkey_client.hset.call_args
+    assert kwargs["mapping"]["memory"] == "data_test_id"  # Default value
+    assert kwargs["mapping"]["hash"] == "hash_test_id"  # Default value
 
 
 def test_delete(valkey_db, mock_valkey_client):
@@ -187,6 +209,15 @@ def test_update(valkey_db, mock_valkey_client):
     assert args[0] == "mem0:test_collection:test_id"
     assert kwargs["mapping"]["memory_id"] == "test_id"
     assert kwargs["mapping"]["memory"] == "updated_data"
+    assert kwargs["mapping"]["hash"] == "test_hash"
+    assert kwargs["mapping"]["user_id"] == "test_user"
+    # Check updated_at is set (defaults to created_at if not provided)
+    assert "updated_at" in kwargs["mapping"]
+    # Check metadata excludes system keys
+    metadata = json.loads(kwargs["mapping"]["metadata"])
+    assert "user_id" not in metadata
+    assert "hash" not in metadata
+    assert "data" not in metadata
 
 
 def test_update_handles_missing_created_at(valkey_db, mock_valkey_client):
@@ -202,6 +233,42 @@ def test_update_handles_missing_created_at(valkey_db, mock_valkey_client):
     mock_valkey_client.hset.assert_called_once()
     args, kwargs = mock_valkey_client.hset.call_args
     assert "created_at" in kwargs["mapping"]  # Should be added automatically
+    assert "updated_at" in kwargs["mapping"]  # Should also be set
+
+
+def test_update_handles_missing_data_and_hash_fields(valkey_db, mock_valkey_client):
+    """Test updating vectors with missing data and hash fields uses default values."""
+    vector = np.random.rand(1536).tolist()
+    payload = {}  # No data or hash fields
+
+    valkey_db.update(vector_id="test_id", vector=vector, payload=payload)
+
+    mock_valkey_client.hset.assert_called_once()
+    args, kwargs = mock_valkey_client.hset.call_args
+    assert kwargs["mapping"]["memory"] == "data_test_id"  # Default value
+    assert kwargs["mapping"]["hash"] == "hash_test_id"  # Default value
+
+
+def test_update_preserves_provided_updated_at(valkey_db, mock_valkey_client):
+    """Test that update uses provided updated_at timestamp."""
+    vector = np.random.rand(1536).tolist()
+    created = datetime.now(pytz.timezone("UTC")).isoformat()
+    updated = datetime.now(pytz.timezone("UTC")).isoformat()
+    payload = {
+        "hash": "test_hash",
+        "data": "updated_data",
+        "created_at": created,
+        "updated_at": updated,
+    }
+
+    valkey_db.update(vector_id="test_id", vector=vector, payload=payload)
+
+    mock_valkey_client.hset.assert_called_once()
+    args, kwargs = mock_valkey_client.hset.call_args
+    # updated_at should be the provided timestamp converted to int
+    assert "updated_at" in kwargs["mapping"]
+    expected_updated = int(datetime.fromisoformat(updated).timestamp())
+    assert kwargs["mapping"]["updated_at"] == expected_updated
 
 
 def test_update_with_none_vector_preserves_embedding(valkey_db, mock_valkey_client):
@@ -1017,6 +1084,6 @@ def test_cluster_mode_get(valkey_db_cluster, mock_valkey_cluster_client):
 
 
 def test_cluster_mode_delete(valkey_db_cluster, mock_valkey_cluster_client):
-    """Test that delete works in cluster mode."""
+    """Test that delete works in cluster mode with hash-tagged prefix for slot colocation."""
     valkey_db_cluster.delete("id1")
-    mock_valkey_cluster_client.delete.assert_called_once_with("mem0:test_cluster:id1")
+    mock_valkey_cluster_client.delete.assert_called_once_with("mem0:{test_cluster}:id1")

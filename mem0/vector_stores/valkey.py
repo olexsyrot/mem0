@@ -14,6 +14,13 @@ from mem0.vector_stores.base import VectorStoreBase
 
 logger = logging.getLogger(__name__)
 
+# Index type constants
+INDEX_TYPE_HNSW = "hnsw"
+INDEX_TYPE_FLAT = "flat"
+
+# Key prefix constant
+KEY_PREFIX = "mem0"
+
 # Default fields for the Valkey index
 DEFAULT_FIELDS = [
     {"name": "memory_id", "type": "tag"},
@@ -48,7 +55,7 @@ class ValkeyDB(VectorStoreBase):
         collection_name: str,
         embedding_model_dims: int,
         timezone: str = "UTC",
-        index_type: str = "hnsw",
+        index_type: str = INDEX_TYPE_HNSW,
         hnsw_m: int = 16,
         hnsw_ef_construction: int = 200,
         hnsw_ef_runtime: int = 10,
@@ -70,16 +77,20 @@ class ValkeyDB(VectorStoreBase):
         """
         self.embedding_model_dims = embedding_model_dims
         self.collection_name = collection_name
-        self.prefix = f"mem0:{collection_name}"
+        self.cluster_mode = cluster_mode
+        # Use hash-tagged prefix for cluster mode to ensure slot colocation
+        if cluster_mode:
+            self.prefix = f"{KEY_PREFIX}:{{{collection_name}}}"
+        else:
+            self.prefix = f"{KEY_PREFIX}:{collection_name}"
         self.timezone = timezone
         self.index_type = index_type.lower()
         self.hnsw_m = hnsw_m
         self.hnsw_ef_construction = hnsw_ef_construction
         self.hnsw_ef_runtime = hnsw_ef_runtime
-        self.cluster_mode = cluster_mode
 
         # Validate index type
-        if self.index_type not in ["hnsw", "flat"]:
+        if self.index_type not in [INDEX_TYPE_HNSW, INDEX_TYPE_FLAT]:
             raise ValueError(f"Invalid index_type: {index_type}. Must be 'hnsw' or 'flat'")
 
         # Connect to Valkey
@@ -98,7 +109,25 @@ class ValkeyDB(VectorStoreBase):
         # Create the index schema
         self._create_index(embedding_model_dims)
 
-    def _build_index_schema(self, collection_name, embedding_dims, distance_metric, prefix):
+    def _get_index_prefix(self, collection_name=None):
+        """
+        Get the prefix for FT.CREATE INDEX command.
+
+        In cluster mode, returns bare prefix (no hash tags) because keys use hash-tagged format.
+        In non-cluster mode, returns full prefix with collection name.
+
+        Args:
+            collection_name (str, optional): Name of the collection. Defaults to self.collection_name.
+
+        Returns:
+            str: Prefix for FT.CREATE INDEX (must not contain hash tags for ElastiCache)
+        """
+        collection_name = collection_name or self.collection_name
+        if self.cluster_mode:
+            return f"{KEY_PREFIX}:"
+        return f"{KEY_PREFIX}:{collection_name}"
+
+    def _build_index_schema(self, collection_name, embedding_dims, distance_metric, index_prefix):
         """
         Build the FT.CREATE command for index creation.
 
@@ -106,13 +135,13 @@ class ValkeyDB(VectorStoreBase):
             collection_name (str): Name of the collection/index
             embedding_dims (int): Vector embedding dimensions
             distance_metric (str): Distance metric (e.g., "COSINE", "L2", "IP")
-            prefix (str): Key prefix for the index
+            index_prefix (str): Prefix for FT.CREATE INDEX (must not contain hash tags)
 
         Returns:
             list: Complete FT.CREATE command as list of arguments
         """
         # Build the vector field configuration based on index type
-        if self.index_type == "hnsw":
+        if self.index_type == INDEX_TYPE_HNSW:
             vector_config = [
                 "embedding",
                 "VECTOR",
@@ -131,7 +160,7 @@ class ValkeyDB(VectorStoreBase):
                 "EF_RUNTIME",
                 str(self.hnsw_ef_runtime),
             ]
-        elif self.index_type == "flat":
+        elif self.index_type == INDEX_TYPE_FLAT:
             vector_config = [
                 "embedding",
                 "VECTOR",
@@ -156,7 +185,7 @@ class ValkeyDB(VectorStoreBase):
             "HASH",
             "PREFIX",
             "1",
-            prefix,
+            index_prefix,
             "SCHEMA",
             "memory_id",
             "TAG",
@@ -219,7 +248,7 @@ class ValkeyDB(VectorStoreBase):
             self.collection_name,
             embedding_model_dims,
             "COSINE",  # Fixed distance metric for initialization
-            self.prefix,
+            self._get_index_prefix(),
         )
 
         try:
@@ -245,7 +274,11 @@ class ValkeyDB(VectorStoreBase):
         collection_name = name or self.collection_name
         embedding_dims = vector_size or self.embedding_model_dims
         distance_metric = distance or "COSINE"
-        prefix = f"mem0:{collection_name}"
+        # Use hash-tagged prefix for cluster mode to ensure slot colocation
+        if self.cluster_mode:
+            prefix = f"{KEY_PREFIX}:{{{collection_name}}}"
+        else:
+            prefix = f"{KEY_PREFIX}:{collection_name}"
 
         # Try to drop the index if it exists (cleanup before creation)
         self._drop_index(collection_name, log_level="silent")
@@ -255,7 +288,7 @@ class ValkeyDB(VectorStoreBase):
             collection_name,
             embedding_dims,
             distance_metric,  # Configurable distance metric
-            prefix,
+            self._get_index_prefix(collection_name),
         )
 
         try:
@@ -304,10 +337,15 @@ class ValkeyDB(VectorStoreBase):
                     "embedding": np.array(vector, dtype=np.float32).tobytes(),
                 }
 
-                # Add optional fields
+                # Add optional fields (always set with defaults) to work around valkey-search bug
+                # where missing indexed fields cause silent indexing failures.
+                # See: https://github.com/valkey-io/valkey-search/pull/382
+                # Fixed in valkey-search 1.0.2 but kept for backward compatibility.
                 for field in ["agent_id", "run_id", "user_id"]:
-                    if field in payload:
-                        hash_data[field] = payload[field]
+                    hash_data[field] = payload.get(field, "")
+
+                # Ensure updated_at is always set (required for ElastiCache indexing)
+                hash_data["updated_at"] = hash_data["created_at"]
 
                 # Add metadata
                 hash_data["metadata"] = json.dumps({k: v for k, v in payload.items() if k not in excluded_keys})
@@ -438,7 +476,7 @@ class ValkeyDB(VectorStoreBase):
         vector_bytes = np.array(vectors, dtype=np.float32).tobytes()
 
         # Build the KNN part with optional EF_RUNTIME for HNSW
-        if self.index_type == "hnsw" and ef_runtime is not None:
+        if self.index_type == INDEX_TYPE_HNSW and ef_runtime is not None:
             knn_part = f"[KNN {top_k} @embedding $vec_param EF_RUNTIME {ef_runtime} AS vector_score]"
         else:
             # For FLAT indexes or when ef_runtime is None, use basic KNN
@@ -511,10 +549,18 @@ class ValkeyDB(VectorStoreBase):
             if "updated_at" in payload:
                 hash_data["updated_at"] = int(datetime.fromisoformat(payload["updated_at"]).timestamp())
 
-            # Add optional fields
+            # Add optional fields (always set with defaults) to work around valkey-search bug
+            # where missing indexed fields cause silent indexing failures.
+            # See: https://github.com/valkey-io/valkey-search/pull/382
+            # Fixed in valkey-search 1.0.2 but kept for backward compatibility.
             for field in ["agent_id", "run_id", "user_id"]:
-                if field in payload:
-                    hash_data[field] = payload[field]
+                hash_data[field] = payload.get(field, "")
+
+            # Ensure updated_at is always set (required for ElastiCache indexing)
+            if "updated_at" not in hash_data:
+                hash_data["updated_at"] = hash_data.get(
+                    "created_at", int(datetime.now(pytz.timezone(self.timezone)).timestamp())
+                )
 
             # Add metadata
             hash_data["metadata"] = json.dumps({k: v for k, v in payload.items() if k not in excluded_keys})
@@ -724,8 +770,8 @@ class ValkeyDB(VectorStoreBase):
         Returns:
             dict: Information about the collection.
         """
+        collection_name = name or self.collection_name
         try:
-            collection_name = name or self.collection_name
             return self.client.ft(collection_name).info()
         except Exception as e:
             logger.exception(f"Error getting collection info for {collection_name}: {e}")
